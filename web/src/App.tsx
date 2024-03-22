@@ -1,5 +1,5 @@
 import { SuiClient, getFullnodeUrl } from '@mysten/sui.js/client';
-import { SerializedSignature, decodeSuiPrivateKey } from '@mysten/sui.js/cryptography';
+import {PublicKey, SerializedSignature, SignatureScheme, decodeSuiPrivateKey } from '@mysten/sui.js/cryptography';
 import { Ed25519Keypair } from '@mysten/sui.js/keypairs/ed25519';
 import { TransactionBlock } from '@mysten/sui.js/transactions';
 import {
@@ -10,14 +10,22 @@ import {
     getZkLoginSignature,
     jwtToAddress,
 } from '@mysten/zklogin';
-import { NetworkName, makeSuiExplorerUrl, requestSuiFromFaucet, shortenSuiAddress } from '@polymedia/suits';
+import { NetworkName, requestSuiFromFaucet } from '@polymedia/suits';
 import { jwtDecode } from 'jwt-decode';
 import { useEffect, useRef, useState } from 'react';
 import './App.less';
 
+import { ZkLoginPublicIdentifier} from "@mysten/sui.js/zklogin";
+import { hexToBytes } from '@noble/hashes/utils';
+
 /* Configuration */
 
 import config from './config.json'; // copy and modify config.example.json with your own values
+import { fromB64, toB64 } from '@mysten/sui.js/utils';
+import { MultiSigPublicKey } from '@mysten/sui.js/multisig';
+import { publicKeyFromRawBytes } from '@mysten/sui.js/verify';
+import { Secp256k1Keypair } from '@mysten/sui.js/keypairs/secp256k1';
+import { Secp256r1Keypair } from '@mysten/sui.js/keypairs/secp256r1';
 
 const NETWORK: NetworkName = 'devnet';
 const MAX_EPOCH = 2; // keep ephemeral keys active for this many Sui epochs from now (1 epoch ~= 24h)
@@ -30,10 +38,13 @@ const suiClient = new SuiClient({
 
 const setupDataKey = 'zklogin-demo.setup';
 const accountDataKey = 'zklogin-demo.accounts';
+const insecurePrivateKeys = 'zklogin-demo.private-keys';
 
 /* Types */
 
-type OpenIdProvider = 'Google' | 'Twitch' | 'Facebook';
+type OpenIdProvider = 'Google' | 'Twitch' | 'Facebook' | 'Apple' | 'Kakao' | 'Slack';
+
+// | 'Microsoft' | 'AWS';
 
 type SetupData = {
     provider: OpenIdProvider;
@@ -49,22 +60,126 @@ type AccountData = {
     ephemeralPrivateKey: string;
     userSalt: string;
     sub: string;
+    iss: string;
     aud: string;
     maxEpoch: number;
+}
+
+type KeyData = {
+    secretKey: string;
+    publicKey: string;
+    scheme: SignatureScheme;
+}
+
+export function toPaddedBigEndianBytes(num: bigint, width: number): Uint8Array {
+	const hex = num.toString(16);
+	return hexToBytes(hex.padStart(width * 2, '0').slice(-width * 2));
+}
+
+export function toZkLoginPublicIdentifier(
+	addressSeed: bigint,
+	iss: string,
+): ZkLoginPublicIdentifier {
+	// Consists of iss_bytes_len || iss_bytes || padded_32_byte_address_seed.
+	const addressSeedBytesBigEndian = toPaddedBigEndianBytes(addressSeed, 32);
+	const issBytes = new TextEncoder().encode(iss);
+	const tmp = new Uint8Array(1 + issBytes.length + addressSeedBytesBigEndian.length);
+	tmp.set([issBytes.length], 0);
+	tmp.set(issBytes, 1);
+	tmp.set(addressSeedBytesBigEndian, 1 + issBytes.length);
+	return new ZkLoginPublicIdentifier(tmp);
+}
+
+function toPkIdentifier(account: AccountData): ZkLoginPublicIdentifier {
+    const addressSeed = genAddressSeed(
+        BigInt(account.userSalt),
+        'sub',
+        account.sub,
+        account.aud,
+    ).toString();
+    let pk = toZkLoginPublicIdentifier(
+        BigInt(addressSeed),
+        account.iss,
+    )
+    return pk;
+}
+
+function toMultisigAddress(accounts: AccountData[], privateKeys: KeyData[], threshold: number): [MultiSigPublicKey, string] {
+	let pks: { publicKey: PublicKey; weight: number }[] = [];
+	accounts.forEach((item: AccountData) => {
+        const pk = toPkIdentifier(item);
+        pks.push({ publicKey: pk, weight: 1 });
+    });
+
+    privateKeys.forEach((item: KeyData) => {
+        const pk = publicKeyFromRawBytes(item.scheme, fromB64(item.publicKey));
+        pks.push({ publicKey: pk, weight: 1 });
+    });
+
+    const multiSigPublicKey = MultiSigPublicKey.fromPublicKeys({
+		threshold,
+		publicKeys: pks,
+	});
+	return [multiSigPublicKey, multiSigPublicKey.toSuiAddress()];
+}
+
+function generateRandomKeyPair() {
+    // randomly generate a keypair of random scheme. 
+    let random = Math.floor(Math.random() * 3);
+    let sk = null;
+    if (random === 0) {
+        sk = Ed25519Keypair.generate();
+    }  else if (random === 1) {
+        sk = Secp256k1Keypair.generate();
+    } else {
+        sk = Secp256r1Keypair.generate();
+    }
+    console.log('scheme: ', sk.getKeyScheme());
+    return sk;
+}
+function createTx(msAddress: string): TransactionBlock {
+    const txBytes = new TransactionBlock();
+    txBytes.setSender(msAddress);
+    return txBytes;
 }
 
 export const App: React.FC = () =>
 {
     const accounts = useRef<AccountData[]>(loadAccounts()); // useRef() instead of useState() because of setInterval()
-    const [balances, setBalances] = useState<Map<string, number>>(new Map()); // Map<Sui address, SUI balance>
+    const [privateKeys, setPrivateKeys] = useState<KeyData[]>(loadPrivateKeys()); // useState() to manage privateKeys state
+    const [balance, setBalance] = useState<number>(0); // Map<Sui address, SUI balance>
     const [modalContent, setModalContent] = useState<string>('');
+    const [msAddress, setMsAddress] = useState<string>(''); // multisig address
+    const [txDigest, setTxDigest] = useState<string>(''); // tx digest
+    const [msPublicKey, setMsPublicKey] = useState<MultiSigPublicKey | null >(null); // multisig pubkey
+    const [txBytes, setTxBytes] = useState<TransactionBlock | null >( null); // tx bytes
+    const [sigs, setSigs] = useState<string[]>([]);
+    const [combined, setCombinedSig] = useState<string>('');
+
+    const [threshold, setThresholdValue] = useState(0);
+
+    const addPrivateKeyHandler = () => {
+        let sk = generateRandomKeyPair();
+        let privateKey = { secretKey: sk.getSecretKey(), publicKey: sk.getPublicKey().toBase64(), scheme: sk.getKeyScheme()};
+        const updatedPrivateKeys = [...privateKeys, privateKey];
+        setPrivateKeys(updatedPrivateKeys);
+        sessionStorage.setItem(insecurePrivateKeys, JSON.stringify(updatedPrivateKeys));
+    };
+
+    const handleThresholdValueChange = (event: any) => {
+        setThresholdValue(event.target.value);
+    };
 
     useEffect(() => {
         completeZkLogin();
-        fetchBalances(accounts.current);
-        const interval = setInterval(() => fetchBalances(accounts.current), 5_000);
-        return () => {clearInterval(interval)};
-    }, []);
+        if (msAddress!== '') {
+            fetchBalance(msAddress);
+            const interval = setInterval(() => fetchBalance(msAddress), 5_000);
+            return () => {clearInterval(interval)};
+        } else {
+            return;
+        }
+    }, [msAddress]);
 
     /* zkLogin end-to-end */
 
@@ -78,8 +193,10 @@ export const App: React.FC = () =>
 
         // Create a nonce
         const { epoch } = await suiClient.getLatestSuiSystemState();
+        console.log('epoch', epoch);
         const maxEpoch = Number(epoch) + MAX_EPOCH; // the ephemeral key will be valid for MAX_EPOCH from now
-        const ephemeralKeyPair = new Ed25519Keypair();
+        console.log('maxEpoch', maxEpoch);
+        const ephemeralKeyPair = generateRandomKeyPair();
         const randomness = generateRandomness();
         const nonce = generateNonce(ephemeralKeyPair.getPublicKey(), maxEpoch, randomness);
 
@@ -126,6 +243,22 @@ export const App: React.FC = () =>
                 });
                 loginUrl = `https://www.facebook.com/v19.0/dialog/oauth?${urlParams.toString()}`;
                 break;
+            }
+            case 'Apple': {
+                const urlParams = new URLSearchParams({
+                    client_id: config.CLIENT_ID_APPLE,
+                    redirect_uri: 'https://sui.io/',
+                    scope: 'name email',
+                    response_mode: 'form_post',
+                    response_type: 'code id_token',
+                    nonce: nonce,
+                });
+                loginUrl = `https://appleid.apple.com/auth/authorize?${urlParams.toString()}`;
+                break;
+            }
+            default: {
+                console.warn(`not supported: ${provider}`);
+                return;
             }
         }
         window.location.replace(loginUrl);
@@ -258,24 +391,27 @@ export const App: React.FC = () =>
             ephemeralPrivateKey: setupData.ephemeralPrivateKey,
             userSalt: userSalt.toString(),
             sub: jwtPayload.sub,
+            iss: jwtPayload.iss!,
             aud: typeof jwtPayload.aud === 'string' ? jwtPayload.aud : jwtPayload.aud[0],
-            maxEpoch: setupData.maxEpoch,
+            maxEpoch: setupData.maxEpoch
         });
     }
 
+    async function signTxWithPrivateKey(key: KeyData, txb: TransactionBlock) {
+        const kp = keypairFromSecretKey(key.secretKey);
+        const { signature: userSignature } = await txb.sign({
+            client: suiClient,
+            signer: kp,
+        });
+        setSigs(prevSigs => [...prevSigs, userSignature]);
+    }
     /**
      * Assemble a zkLogin signature and submit a transaction
      * https://docs.sui.io/concepts/cryptography/zklogin#assemble-the-zklogin-signature-and-submit-the-transaction
      */
-    async function sendTransaction(account: AccountData) {
-        setModalContent('🚀 Sending transaction...');
-
-        // Sign the transaction bytes with the ephemeral private key
-        const txb = new TransactionBlock();
-        txb.setSender(account.userAddr);
-
+    async function signTransaction(account: AccountData, txb: TransactionBlock) {
         const ephemeralKeyPair = keypairFromSecretKey(account.ephemeralPrivateKey);
-        const { bytes, signature: userSignature } = await txb.sign({
+        const { signature: userSignature } = await txb.sign({
             client: suiClient,
             signer: ephemeralKeyPair,
         });
@@ -299,17 +435,29 @@ export const App: React.FC = () =>
             userSignature,
         });
 
+        setSigs(prevSigs => [...prevSigs, zkLoginSignature]);
+    }
+
+    /**
+     * Assemble a zkLogin signature and submit a transaction
+     * https://docs.sui.io/concepts/cryptography/zklogin#assemble-the-zklogin-signature-and-submit-the-transaction
+     */
+    async function sendTransaction(txBytes: TransactionBlock, msPublicKey: MultiSigPublicKey, sigs: string[]) {
+        setModalContent('🚀 Sending transaction...');
+		const combined = msPublicKey!.combinePartialSignatures(sigs);
+        setCombinedSig(combined);
+
         // Execute the transaction
         await suiClient.executeTransactionBlock({
-            transactionBlock: bytes,
-            signature: zkLoginSignature,
+            transactionBlock: await txBytes.build(),
+            signature: combined,
             options: {
                 showEffects: true,
             },
         })
         .then(result => {
             console.debug('[sendTransaction] executeTransactionBlock response:', result);
-            fetchBalances([account]);
+            setTxDigest(result.digest);
         })
         .catch(error => {
             console.warn('[sendTransaction] executeTransactionBlock failed:', error);
@@ -323,32 +471,26 @@ export const App: React.FC = () =>
     /**
      * Create a keypair from a base64-encoded secret key
      */
-    function keypairFromSecretKey(privateKeyBase64: string): Ed25519Keypair {
+    function keypairFromSecretKey(privateKeyBase64: string) {
         const keyPair = decodeSuiPrivateKey(privateKeyBase64);
-        return Ed25519Keypair.fromSecretKey(keyPair.secretKey);
+        if (keyPair.schema == 'ED25519') {
+            return Ed25519Keypair.fromSecretKey(keyPair.secretKey);
+        } else if (keyPair.schema == 'Secp256k1') {
+            return Secp256k1Keypair.fromSecretKey(keyPair.secretKey);
+        } else {
+            return Secp256r1Keypair.fromSecretKey(keyPair.secretKey);
+        }
     }
 
     /**
      * Get the SUI balance for each account
      */
-    async function fetchBalances(accounts: AccountData[]) {
-        if (accounts.length == 0) {
-            return;
-        }
-        const newBalances = new Map<string, number>();
-        for (const account of accounts) {
-            const suiBalance = await suiClient.getBalance({
-                owner: account.userAddr,
+    async function fetchBalance(msAddress: string) {
+        const suiBalance = await suiClient.getBalance({
+                owner: msAddress,
                 coinType: '0x2::sui::SUI',
             });
-            newBalances.set(
-                account.userAddr,
-                +suiBalance.totalBalance/1_000_000_000
-            );
-        }
-        setBalances(prevBalances =>
-            new Map([...prevBalances, ...newBalances])
-        );
+        setBalance(Number(suiBalance.totalBalance)/1_000_000_000);
     }
 
     /* Session storage */
@@ -374,7 +516,6 @@ export const App: React.FC = () =>
         const newAccounts = [account, ...accounts.current];
         sessionStorage.setItem(accountDataKey, JSON.stringify(newAccounts));
         accounts.current = newAccounts;
-        fetchBalances([account]);
     }
 
     function loadAccounts(): AccountData[] {
@@ -386,17 +527,25 @@ export const App: React.FC = () =>
         return data;
     }
 
+    function loadPrivateKeys(): KeyData[] {
+        const dataRaw = sessionStorage.getItem(insecurePrivateKeys);
+        if (!dataRaw) {
+            return [];
+        }
+        const data: KeyData[] = JSON.parse(dataRaw);
+        return data;
+    }
+
     function clearState(): void {
         sessionStorage.clear();
         accounts.current = [];
-        setBalances(new Map());
     }
 
     /* HTML */
-
-    const openIdProviders: OpenIdProvider[] = isLocalhost()
-        ? ['Google', 'Twitch', 'Facebook']
-        : ['Google', 'Twitch']; // Facebook requires business verification to publish the app
+    const openIdProviders: OpenIdProvider[] = ['Google', 'Twitch'];
+    // const openIdProviders: OpenIdProvider[] = isLocalhost()
+    //     ? ['Google', 'Twitch', 'Facebook', 'Apple', 'Kakao', 'Slack', 'Microsoft', 'AWS']
+    //     : ['Google', 'Twitch']; // Facebook requires business verification to publish the app
     return (
     <div id='page'>
 
@@ -410,7 +559,7 @@ export const App: React.FC = () =>
             <label>{NETWORK}</label>
         </div>
 
-        <h1>Sui zkLogin demo</h1>
+        <h1>Sui Multisig with zkLogin Test App</h1>
 
         <div id='login-buttons' className='section'>
             <h2>Log in:</h2>
@@ -425,49 +574,152 @@ export const App: React.FC = () =>
             )}
         </div>
 
-        { accounts.current.length > 0 &&
-        <div id='accounts' className='section'>
-            <h2>Accounts:</h2>
-            {accounts.current.map(acct => {
-                const balance = balances.get(acct.userAddr);
-                const explorerLink = makeSuiExplorerUrl(NETWORK, 'address', acct.userAddr);
-                return (
-                <div className='account' key={acct.userAddr}>
-                    <div>
-                        <label className={`provider ${acct.provider}`}>{acct.provider}</label>
-                    </div>
-                    <div>
-                        Address: <a target='_blank' rel='noopener noreferrer' href={explorerLink}>
-                            {shortenSuiAddress(acct.userAddr, 6, 6, '0x', '...')}
-                        </a>
-                    </div>
-                    <div>User ID: {acct.sub}</div>
-                    <div>Balance: {typeof balance === 'undefined' ? '(loading)' : `${balance} SUI`}</div>
-                    <button
-                        className={`btn-send ${!balance ? 'disabled' : ''}`}
-                        disabled={!balance}
-                        onClick={() => {sendTransaction(acct)}}
-                    >
-                        Send transaction
-                    </button>
-                    { balance === 0 &&
-                        <button
-                            className='btn-faucet'
-                            onClick={() => {
-                                requestSuiFromFaucet(NETWORK, acct.userAddr);
-                                setModalContent('💰 Requesting SUI from faucet. This will take a few seconds...');
-                                setTimeout(() => { setModalContent('') }, 3000);
-                            }}
-                        >
-                            Use faucet
-                        </button>
-                    }
-                    <hr/>
-                </div>
-                );
-            })}
+        <div id='login-buttons' className='section'>
+            <button className={`btn-sk`} onClick={addPrivateKeyHandler}>
+                Add Private Key
+            </button>
         </div>
+
+        { accounts.current.length > 0 &&
+            <div id='accounts' className='section'>
+                <h2>Accounts:</h2>
+                {accounts.current.map(acct => {
+                    return (
+                    <div className='account' key={acct.userAddr}>
+                        <div>
+                            <label className={`provider ${acct.provider}`}>{acct.provider}</label>
+                        </div>
+                        <div>Public Identifier: {toB64(toPkIdentifier(acct).toRawBytes())}</div>
+                        
+                        { msAddress && txBytes && (
+                            <button
+                                className={`btn-send ${!balance ? 'disabled' : ''}`}
+                                disabled={!balance}
+                                onClick={() => {signTransaction(acct, txBytes)}}
+                            >
+                                Sign Transaction
+                            </button>)}
+
+                        {/* <input className='input' type="text" 
+                            onChange={(event) => handleWeightChange(event, acct)}
+                        /> */}
+
+                        <hr/>
+                    </div>
+                    );
+                })}
+            </div>
         }
+
+        { privateKeys.length > 0 &&
+            <div id='accounts' className='section'>
+                <h2>Private keys:</h2>
+                {privateKeys.map(k => {
+                    return (
+                    <div className='account'>
+                        <div>Public key: {k.publicKey}</div>
+                        
+                        { msAddress && txBytes && (
+                            <button
+                                className={`btn-send ${!balance ? 'disabled' : ''}`}
+                                disabled={!balance}
+                                onClick={() => {signTxWithPrivateKey(k, txBytes)}}
+                            >
+                                Sign Transaction
+                            </button>)}
+                        <hr/>
+                    </div>
+                    );
+                })}
+            </div>
+        }
+        Threshold: <input className='input'
+            type="text"
+            value={threshold}
+            onChange={handleThresholdValueChange}
+        />
+
+        { (accounts.current.length > 0 || privateKeys.length) &&
+            <button className='btn-faucet' onClick={() => {
+                let [msPublicKey, msAddress] = toMultisigAddress(accounts.current, privateKeys, threshold);
+                setMsPublicKey(msPublicKey);
+                setMsAddress(msAddress);
+            }}>
+            To Multisig Address
+            </button>
+        }
+
+        { msAddress && (
+            <div>
+                <h2>MultiSig Address:</h2>
+                <div>{msAddress}</div>
+            </div>
+        )}
+
+        { msAddress && 
+            <div>
+                Balance: {typeof balance === 'undefined' ? '(loading)' : `${balance} SUI`}
+            </div>
+        }
+        
+        { msAddress && 
+            <button className='btn-faucet' onClick={() => {
+                requestSuiFromFaucet(NETWORK, msAddress);
+                setModalContent('💰 Requesting SUI from faucet. This will take a few seconds...');
+                setTimeout(() => { setModalContent('') }, 3000);
+            }}>
+                Use faucet
+            </button>
+        }
+
+        { msAddress && (
+            <button className={`btn-send ${!balance ? 'disabled' : ''}`}
+                    onClick={() => {setTxBytes(createTx(msAddress))}}>
+                Create Transaction
+            </button>
+        )}
+
+        { txBytes && (
+            <div>
+                <h2>Transaction bytes: </h2>
+                <div>{txBytes.serialize()}</div>
+            </div>
+        )}
+
+        { sigs.length > 0 && (
+            <div>
+                <h3>Signatures:</h3>
+                <ul>
+                    {sigs.map((signature, index) => (
+                        <li key={index}>{signature}</li>
+                    ))}
+                </ul>
+            </div>
+            )
+        }
+
+        { txBytes && msPublicKey && (
+            <button className={`btn-send ${!balance ? 'disabled' : ''}`}
+                    onClick={() => {sendTransaction(txBytes, msPublicKey, sigs)}}>
+                Submit Transaction
+            </button>
+        )}
+
+        {combined && (
+            <div>
+                <h2>Combined multisig:</h2>
+                <div>{combined}</div>
+            </div>
+        )}
+ 
+        {txDigest && (
+            <div>
+                <h2>Tx digest:</h2>
+                <div>https://explorer.polymedia.app/txblock/{txDigest}?network=devnet</div>
+                <div>https://suiscan.xyz/devnet/tx/{txDigest}</div>
+                <div>https://suivision.xyz/txblock/{txDigest}?network=devnet</div>
+            </div>
+        )}
 
         <div className='section'>
             <button
@@ -503,7 +755,7 @@ const Modal: React.FC<{
     );
 }
 
-function isLocalhost(): boolean {
-    const hostname = window.location.hostname;
-    return hostname === 'localhost' || hostname === '127.0.0.1';
-}
+// function isLocalhost(): boolean {
+//     const hostname = window.location.hostname;
+//     return hostname === 'localhost' || hostname === '127.0.0.1';
+// }

@@ -76,6 +76,30 @@ h1 {
         }
     }
 }
+.input {
+    width: 100%;
+    max-width: 270px;
+    border: 2px solid black;
+    border-radius: 12px;
+    padding: 0.5rem 1rem;
+    margin: 0.5rem 0;
+    font-size: 1rem;
+    &.error {
+        border-color: red;
+    }
+}
+.btn-sk {
+    width: 100%;
+    max-width: 270px;
+    border: 2px solid black;
+    border-radius: 12px;
+    padding: 0.5rem 1rem;
+    margin: 0.5rem 0;
+    font-size: 1rem;
+    &.error {
+        border-color: red;
+    }
+}
 
 .btn-send, .btn-faucet, .btn-clear {
     border: 2px solid black;
@@ -134,6 +158,10 @@ h1 {
 
 &.Facebook {
     background-color: #0766ff;
+}
+
+&.Apple, &.AWS, &.Microsoft, &.Kakao, &.Slack {
+    background-color: #130301;
 }
 
 // Modal copied from https://github.com/juzybits/polymedia-timezones

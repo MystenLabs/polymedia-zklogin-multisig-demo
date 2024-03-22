@@ -1,3 +1,28 @@
+# multisig-zklogin-test-app
+
+This is a fork of https://github.com/juzybits/polymedia-zklogin-demo. 
+
+It demonstrates how to create a multisig address using a combinations of zklogin accounts and private keys. 
+
+It first creates a multisig address with a threshold. After funding the address from faucet, a transaction can be signed with the participating zkLogin accounts and private keys. 
+
+If the combined signature hits the threshold, the transaction executes successfully with the combined Multisig. 
+
+Create and modify config.json:
+
+```
+cp web/src/config.example.json web/src/config.json
+```
+
+Run the app locally:
+
+```
+cd web/
+pnpm install && pnpm serve
+```
+
+The app is live: https://multisig-zklogin-test-app.vercel.app/
+
 # Sui zkLogin demo
 
 ![Sui zkLogin demo](https://zklogin-demo.polymedia.app/img/open-graph.png)
